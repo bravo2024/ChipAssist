@@ -1,129 +1,125 @@
+"""model.py — BM25 retriever and spec extractor for ChipAssist (Marvell).
+
+Uses Okapi BM25 (Robertson & Zaragoza 2009) instead of TF-IDF.
+Also includes a spec extraction function using regex patterns.
+
+BM25(q, d) = sum_t IDF(t) * (tf * (k1+1)) / (tf + k1*(1 - b + b*|d|/avgdl))
+"""
 from __future__ import annotations
+import re
+from collections import Counter
+from typing import Any
+
 import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import StratifiedKFold
-from src.core import build_models, compute_metrics, ks_statistic
+
+from src.core import _tokenize
 
 
-def train_all_models(data, seed=42, test_size=0.25):
-    X = data["X"].copy()
-    y = data["y"].values if hasattr(data["y"], "values") else data["y"].copy()
-    cat_cols = data.get("categorical_features", [])
-    for c in cat_cols:
-        if c in X.columns:
-            le = LabelEncoder()
-            X[c] = le.fit_transform(X[c].astype(str))
-    num_cols = data.get("numerical_features", [])
-    for c in num_cols:
-        if c in X.columns:
-            X[c] = X[c].fillna(X[c].median())
-    from sklearn.model_selection import train_test_split as _tts
-    X_train, X_test, y_train, y_test = _tts(
-        X, y, test_size=test_size, stratify=y, random_state=seed
-    )
-    scaler = StandardScaler()
-    num_cols_actual = [c for c in num_cols if c in X_train.columns]
-    X_train_scaled = X_train.copy()
-    X_test_scaled = X_test.copy()
-    if num_cols_actual:
-        X_train_scaled[num_cols_actual] = scaler.fit_transform(X_train[num_cols_actual])
-        X_test_scaled[num_cols_actual] = scaler.transform(X_test[num_cols_actual])
-    models = build_models(X_train_scaled, y_train, seed=seed)
-    results = {}
-    for name, model in models.items():
-        y_proba = model.predict_proba(X_test_scaled)[:, 1]
-        y_pred = (y_proba >= 0.5).astype(int)
-        metrics = compute_metrics(y_test, y_pred, y_proba)
-        metrics["ks"] = ks_statistic(y_test, y_proba)
-        results[name] = {"metrics": metrics, "y_proba": y_proba, "y_pred": y_pred}
-    return {
-        "models": models,
-        "results": results,
-        "scaler": scaler,
-        "X_train": X_train_scaled,
-        "X_test": X_test_scaled,
-        "y_train": y_train,
-        "y_test": y_test,
-        "features": list(X.columns),
-        "n_train": len(y_train),
-        "n_test": len(y_test),
-    }
+class BM25Retriever:
+    """Okapi BM25 retriever over a document corpus."""
 
+    def __init__(self, k1=1.5, b=0.75):
+        self.k1 = k1
+        self.b = b
+        self.documents: list[dict[str, Any]] = []
+        self.doc_freqs: list[dict[str, int]] = []
+        self.doc_lens: list[int] = []
+        self.avgdl: float = 0.0
+        self.idf: dict[str, float] = {}
 
-def cross_validate(data, seed=42, n_folds=5):
-    X = data["X"].copy()
-    y = data["y"].values if hasattr(data["y"], "values") else data["y"].copy()
-    cat_cols = data.get("categorical_features", [])
-    for c in cat_cols:
-        if c in X.columns:
-            le = LabelEncoder()
-            X[c] = le.fit_transform(X[c].astype(str))
-    num_cols = data.get("numerical_features", [])
-    for c in num_cols:
-        if c in X.columns:
-            X[c] = X[c].fillna(X[c].median())
-    num_cols_actual = [c for c in num_cols if c in X.columns]
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-    cv_results = {name: {"roc_auc": [], "gini": [], "ks": [], "f1": []}
-                  for name in ["Logistic Regression", "Random Forest", "Gradient Boosting", "XGBoost"]}
-    for train_idx, test_idx in skf.split(X, y):
-        X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
-        y_tr, y_te = y[train_idx], y[test_idx]
-        scaler = StandardScaler()
-        if num_cols_actual:
-            X_tr_scaled = X_tr.copy()
-            X_te_scaled = X_te.copy()
-            X_tr_scaled[num_cols_actual] = scaler.fit_transform(X_tr[num_cols_actual])
-            X_te_scaled[num_cols_actual] = scaler.transform(X_te[num_cols_actual])
-        else:
-            X_tr_scaled, X_te_scaled = X_tr, X_te
-        models = build_models(X_tr_scaled, y_tr, seed=seed)
-        for name, model in models.items():
-            y_proba = model.predict_proba(X_te_scaled)[:, 1]
-            y_pred = (y_proba >= 0.5).astype(int)
-            met = compute_metrics(y_te, y_pred, y_proba)
-            cv_results[name]["roc_auc"].append(met.get("roc_auc", 0))
-            cv_results[name]["gini"].append(met.get("gini", 0))
-            cv_results[name]["ks"].append(ks_statistic(y_te, y_proba))
-            cv_results[name]["f1"].append(met.get("f1", 0))
-    summary = {}
-    for name, scores in cv_results.items():
-        summary[name] = {}
-        for metric, vals in scores.items():
-            summary[name][metric] = {
-                "mean": float(np.mean(vals)),
-                "std": float(np.std(vals)),
-                "values": [float(v) for v in vals],
-            }
-    return summary
+    def fit(self, documents: list[dict[str, Any]]) -> "BM25Retriever":
+        self.documents = list(documents)
+        self.doc_freqs = []
+        self.doc_lens = []
+        vocab = set()
+        for d in self.documents:
+            text = f"{d.get('title', '')} {d.get('content', '')}"
+            tokens = _tokenize(text)
+            self.doc_freqs.append(dict(Counter(tokens)))
+            self.doc_lens.append(len(tokens))
+            vocab.update(tokens)
+        self.avgdl = float(np.mean(self.doc_lens)) if self.doc_lens else 1.0
+        n = len(self.documents)
+        for term in vocab:
+            df = sum(1 for df_doc in self.doc_freqs if term in df_doc)
+            self.idf[term] = float(np.log((n - df + 0.5) / (df + 0.5) + 1))
+        return self
 
-
-def permutation_importance(model, X_val, y_val, metric_fn, n_repeats=10, seed=42):
-    rng = np.random.default_rng(seed)
-    baseline = metric_fn(y_val, model.predict_proba(X_val)[:, 1])
-    importances = []
-    for col_idx in range(X_val.shape[1]):
+    def retrieve(self, query: str, k: int = 3) -> list[dict[str, Any]]:
+        q_tokens = _tokenize(query)
         scores = []
-        for _ in range(n_repeats):
-            X_perm = X_val.copy()
-            X_perm[:, col_idx] = rng.permutation(X_perm[:, col_idx])
-            score = metric_fn(y_val, model.predict_proba(X_perm)[:, 1])
-            scores.append(baseline - score)
-        importances.append({
-            "mean": float(np.mean(scores)),
-            "std": float(np.std(scores)),
-        })
-    return importances
+        for i, doc in enumerate(self.documents):
+            score = 0.0
+            freq = self.doc_freqs[i]
+            dl = self.doc_lens[i]
+            for term in q_tokens:
+                if term not in freq:
+                    continue
+                tf = freq[term]
+                idf = self.idf.get(term, 0.0)
+                num = tf * (self.k1 + 1)
+                den = tf + self.k1 * (1 - self.b + self.b * dl / max(self.avgdl, 1))
+                score += idf * num / den
+            scores.append((score, i))
+        scores.sort(reverse=True)
+        results = []
+        for score, idx in scores[:k]:
+            if score <= 0:
+                continue
+            doc = self.documents[idx]
+            results.append({
+                "doc_id": doc["id"], "title": doc.get("title", ""),
+                "content": doc.get("content", ""), "category": doc.get("category", ""),
+                "score": float(score),
+            })
+        return results
+        return results
 
 
-def threshold_sweep(y_true, y_proba):
-    thresholds = np.linspace(0.05, 0.95, 91)
-    rows = []
-    for tau in thresholds:
-        y_pred = (y_proba >= tau).astype(int)
-        met = compute_metrics(y_true, y_pred, y_proba)
-        met["threshold"] = float(tau)
-        met["accept_rate"] = float((y_pred == 0).mean())
-        rows.append(met)
-    return pd.DataFrame(rows)
+# ── Spec extraction ──────────────────────────────────────────────────────────
+
+_SPEC_PATTERNS = {
+    "voltage": re.compile(r"(\d+\.?\d*\s*V)", re.I),
+    "pins": re.compile(r"(\d+)\s+pins?", re.I),
+    "clock": re.compile(r"(\d+\.?\d*\s*(?:GHz|MHz))", re.I),
+    "cores": re.compile(r"(\d+)\s*(?:core|cores)", re.I),
+    "capacity": re.compile(r"(\d+\s*Gbps)", re.I),
+    "pcie": re.compile(r"(Gen\d)", re.I),
+    "ports": re.compile(r"(\d+)\s*port", re.I),
+    "rate": re.compile(r"(\d+\.?\d*\s*Gbps)", re.I),
+    "encryption": re.compile(r"(AES-\d+)", re.I),
+    "wifi": re.compile(r"802\.11\s*\w*\s*(\w+)", re.I),
+}
+
+
+def extract_specs(text: str) -> dict:
+    """Extract key-value spec pairs from a text passage using regex patterns."""
+    specs = {}
+    for key, pattern in _SPEC_PATTERNS.items():
+        match = pattern.search(text)
+        if match:
+            specs[key] = match.group(1).strip()
+    return specs
+
+
+def build_bm25_retriever(corpus: dict) -> BM25Retriever:
+    """Convenience: fit a BM25Retriever on the corpus."""
+    return BM25Retriever().fit(corpus["documents"])
+
+
+def answer_spec_query(retriever: BM25Retriever, query: str, k: int = 3) -> dict:
+    """Retrieve relevant passages and extract specs from the top result."""
+    retrieved = retriever.retrieve(query, k=k)
+    if not retrieved:
+        return {"answer": "", "source_doc_id": None, "extracted_specs": {}, "retrieved": []}
+    top = retrieved[0]
+    specs = extract_specs(top["content"])
+    if specs:
+        answer = "; ".join(f"{k}: {v}" for k, v in specs.items())
+    else:
+        sentences = re.split(r"(?<=[.!?])\s+", top["content"])
+        q_tokens = set(_tokenize(query))
+        best = max(sentences, key=lambda s: len(q_tokens & set(_tokenize(s))), default=sentences[0] if sentences else "")
+        answer = best.strip() if best else top["content"][:200]
+    return {"answer": answer, "source_doc_id": top["doc_id"],
+            "extracted_specs": specs, "retrieved": retrieved}
